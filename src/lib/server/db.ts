@@ -1,14 +1,31 @@
-import type { User, Torrent, Session } from '$lib/types';
+import type { User, Torrent, Session, UserStats } from '$lib/types';
 import { randomUUID } from 'crypto';
+import { addTrackerToMagnet } from './tracker';
+import {
+	loadUsers, saveUsers,
+	loadSessions, saveSessions,
+	loadTorrents, saveTorrents,
+	hasStoredData,
+	type StoredUser, type StoredSession, type StoredTorrent
+} from './storage';
 
-// In-memory database (replace with real database in production)
-const users: Map<string, User> = new Map();
-const sessions: Map<string, Session> = new Map();
-const torrents: Map<string, Torrent> = new Map();
+// Load persisted data or initialize empty maps
+const users: Map<string, User> = loadUsers() as Map<string, User>;
+const sessions: Map<string, Session> = loadSessions() as Map<string, Session>;
+const torrents: Map<string, Torrent> = loadTorrents() as Map<string, Torrent>;
+const userStats: Map<string, UserStats> = new Map();
 
-// Index for quick lookups
+// Index for quick lookups - rebuild from loaded users
 const usersByEmail: Map<string, string> = new Map();
 const usersByUsername: Map<string, string> = new Map();
+
+// Rebuild indexes from loaded users
+for (const user of users.values()) {
+	usersByEmail.set(user.email.toLowerCase(), user.id);
+	usersByUsername.set(user.username.toLowerCase(), user.id);
+}
+
+console.log(`[DB] Loaded ${users.size} users, ${sessions.size} sessions, ${torrents.size} torrents from storage`);
 
 // User operations
 export function createUser(username: string, email: string, passwordHash: string): User {
@@ -23,6 +40,10 @@ export function createUser(username: string, email: string, passwordHash: string
 	users.set(id, user);
 	usersByEmail.set(email.toLowerCase(), id);
 	usersByUsername.set(username.toLowerCase(), id);
+
+	// Persist to storage
+	saveUsers(users as Map<string, StoredUser>);
+
 	return user;
 }
 
@@ -49,6 +70,10 @@ export function createSession(userId: string): Session {
 		expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
 	};
 	sessions.set(id, session);
+
+	// Persist to storage
+	saveSessions(sessions as Map<string, StoredSession>);
+
 	return session;
 }
 
@@ -57,6 +82,7 @@ export function getSession(id: string): Session | undefined {
 	if (!session) return undefined;
 	if (session.expiresAt < new Date()) {
 		sessions.delete(id);
+		saveSessions(sessions as Map<string, StoredSession>);
 		return undefined;
 	}
 	return session;
@@ -64,6 +90,7 @@ export function getSession(id: string): Session | undefined {
 
 export function deleteSession(id: string): void {
 	sessions.delete(id);
+	saveSessions(sessions as Map<string, StoredSession>);
 }
 
 // Torrent operations
@@ -72,10 +99,16 @@ export function createTorrent(data: Omit<Torrent, 'id' | 'uploadedAt' | 'downloa
 	const torrent: Torrent = {
 		...data,
 		id,
+		// Ensure SeedX tracker is added to the magnet link
+		magnetLink: addTrackerToMagnet(data.magnetLink),
 		uploadedAt: new Date(),
 		downloads: 0
 	};
 	torrents.set(id, torrent);
+
+	// Persist to storage
+	saveTorrents(torrents as Map<string, StoredTorrent>);
+
 	return torrent;
 }
 
@@ -89,21 +122,61 @@ export function getAllTorrents(): Torrent[] {
 	);
 }
 
-export function searchTorrents(query: string, category?: string): Torrent[] {
+export type SortField = 'date' | 'seeders' | 'leechers' | 'size' | 'downloads' | 'name';
+export type SortOrder = 'asc' | 'desc';
+
+export function searchTorrents(
+	query: string,
+	category?: string,
+	subcategory?: string,
+	sortBy: SortField = 'date',
+	sortOrder: SortOrder = 'desc'
+): Torrent[] {
 	const lowerQuery = query.toLowerCase();
-	return getAllTorrents().filter(t => {
+	let results = getAllTorrents().filter(t => {
 		const matchesQuery = !query ||
 			t.name.toLowerCase().includes(lowerQuery) ||
 			t.description.toLowerCase().includes(lowerQuery);
 		const matchesCategory = !category || category === 'all' || t.category === category;
-		return matchesQuery && matchesCategory;
+		const matchesSubcategory = !subcategory || t.subcategory === subcategory || t.quality === subcategory;
+		return matchesQuery && matchesCategory && matchesSubcategory;
 	});
+
+	// Sort results
+	results.sort((a, b) => {
+		let comparison = 0;
+		switch (sortBy) {
+			case 'seeders':
+				comparison = a.seeders - b.seeders;
+				break;
+			case 'leechers':
+				comparison = a.leechers - b.leechers;
+				break;
+			case 'size':
+				comparison = a.size - b.size;
+				break;
+			case 'downloads':
+				comparison = a.downloads - b.downloads;
+				break;
+			case 'name':
+				comparison = a.name.localeCompare(b.name);
+				break;
+			case 'date':
+			default:
+				comparison = new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime();
+				break;
+		}
+		return sortOrder === 'desc' ? -comparison : comparison;
+	});
+
+	return results;
 }
 
 export function incrementDownloads(id: string): void {
 	const torrent = torrents.get(id);
 	if (torrent) {
 		torrent.downloads++;
+		saveTorrents(torrents as Map<string, StoredTorrent>);
 	}
 }
 
@@ -112,114 +185,42 @@ export function updateTorrentStats(id: string, seeders: number, leechers: number
 	if (torrent) {
 		torrent.seeders = seeders;
 		torrent.leechers = leechers;
+		saveTorrents(torrents as Map<string, StoredTorrent>);
 	}
 }
 
-// Seed some demo data
-function seedDemoData() {
-	const demoTorrents: Omit<Torrent, 'id' | 'uploadedAt' | 'downloads'>[] = [
-		{
-			name: 'Ubuntu 24.04 LTS Desktop',
-			description: 'Official Ubuntu 24.04 LTS Desktop ISO - Free and open source operating system',
-			category: 'software',
-			infoHash: 'a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6',
-			size: 5_100_000_000,
-			files: [{ path: 'ubuntu-24.04-desktop-amd64.iso', size: 5_100_000_000 }],
-			seeders: 1250,
-			leechers: 450,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6&dn=Ubuntu+24.04+LTS'
-		},
-		{
-			name: 'Blender 4.0 - Open Source 3D Creation',
-			description: 'Blender is a free and open source 3D creation suite for artists and developers',
-			category: 'software',
-			infoHash: 'b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7',
-			size: 350_000_000,
-			files: [{ path: 'blender-4.0-linux-x64.tar.xz', size: 350_000_000 }],
-			seeders: 890,
-			leechers: 120,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7&dn=Blender+4.0'
-		},
-		{
-			name: 'Big Buck Bunny 4K',
-			description: 'Big Buck Bunny is a short computer-animated comedy film by the Blender Institute - Creative Commons licensed',
-			category: 'movies',
-			infoHash: 'c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8',
-			size: 2_500_000_000,
-			files: [{ path: 'big_buck_bunny_4k.mp4', size: 2_500_000_000 }],
-			seeders: 2100,
-			leechers: 890,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8&dn=Big+Buck+Bunny+4K'
-		},
-		{
-			name: 'Sintel - Open Movie',
-			description: 'Sintel is an independently produced short film by the Blender Institute - Creative Commons',
-			category: 'movies',
-			infoHash: 'd4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9',
-			size: 1_800_000_000,
-			files: [{ path: 'sintel_4k.mkv', size: 1_800_000_000 }],
-			seeders: 560,
-			leechers: 230,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9&dn=Sintel'
-		},
-		{
-			name: 'Free Music Archive Collection',
-			description: 'A curated collection of Creative Commons licensed music from various artists',
-			category: 'music',
-			infoHash: 'e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0',
-			size: 850_000_000,
-			files: [
-				{ path: 'track01.mp3', size: 8_500_000 },
-				{ path: 'track02.mp3', size: 9_200_000 }
-			],
-			seeders: 340,
-			leechers: 89,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0&dn=FMA+Collection'
-		},
-		{
-			name: 'Project Gutenberg eBooks Bundle',
-			description: 'Classic literature from Project Gutenberg - Public domain books in multiple formats',
-			category: 'books',
-			infoHash: 'f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1',
-			size: 2_100_000_000,
-			files: [{ path: 'gutenberg_classics.zip', size: 2_100_000_000 }],
-			seeders: 180,
-			leechers: 45,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1&dn=Gutenberg+Classics'
-		},
-		{
-			name: 'LibreOffice 24.2',
-			description: 'Free and powerful office suite - Compatible with Microsoft Office formats',
-			category: 'software',
-			infoHash: 'g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2',
-			size: 420_000_000,
-			files: [{ path: 'LibreOffice_24.2_Linux_x86-64.tar.gz', size: 420_000_000 }],
-			seeders: 45,
-			leechers: 12,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2&dn=LibreOffice+24.2'
-		},
-		{
-			name: 'Tears of Steel 4K',
-			description: 'Tears of Steel is a short science fiction film by the Blender Institute - Creative Commons',
-			category: 'movies',
-			infoHash: 'h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3',
-			size: 3_200_000_000,
-			files: [{ path: 'tears_of_steel_4k.mkv', size: 3_200_000_000 }],
-			seeders: 2,
-			leechers: 15,
-			uploadedBy: 'system',
-			magnetLink: 'magnet:?xt=urn:btih:h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3&dn=Tears+of+Steel'
-		}
-	];
+// User stats operations
+export function getUserStats(username: string): UserStats {
+	const existing = userStats.get(username.toLowerCase());
+	if (existing) return existing;
 
-	demoTorrents.forEach(t => createTorrent(t));
+	// Calculate stats from torrents
+	const userTorrents = getTorrentsByUser(username);
+	const stats: UserStats = {
+		uploadedTorrents: userTorrents.length,
+		totalUploaded: userTorrents.reduce((sum, t) => sum + t.size * t.seeders, 0),
+		totalDownloaded: userTorrents.reduce((sum, t) => sum + t.size * t.leechers, 0),
+		ratio: 0,
+		avgSpeed: 0
+	};
+	stats.ratio = stats.totalDownloaded > 0 ? stats.totalUploaded / stats.totalDownloaded : Infinity;
+	stats.avgSpeed = userTorrents.length > 0 ? 1_500_000 : 0; // Simulated avg speed
+
+	userStats.set(username.toLowerCase(), stats);
+	return stats;
 }
 
-seedDemoData();
+export function updateUserStats(username: string, uploaded: number, downloaded: number): void {
+	const stats = getUserStats(username);
+	stats.totalUploaded += uploaded;
+	stats.totalDownloaded += downloaded;
+	stats.ratio = stats.totalDownloaded > 0 ? stats.totalUploaded / stats.totalDownloaded : Infinity;
+	userStats.set(username.toLowerCase(), stats);
+}
+
+export function getTorrentsByUser(username: string): Torrent[] {
+	return Array.from(torrents.values())
+		.filter(t => t.uploadedBy.toLowerCase() === username.toLowerCase())
+		.sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime());
+}
+

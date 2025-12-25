@@ -24,6 +24,10 @@
 		"vite": "^7.2.6"
 	},
 	"dependencies": {
-		"cloudflared": "^0.7.1"
+		"cloudflared": "^0.7.1",
+		"create-torrent": "^6.1.0",
+		"parse-torrent": "^11.0.19",
+		"transmission-promise": "^1.1.7",
+		"webtorrent": "^2.8.5"
 	}
 }
